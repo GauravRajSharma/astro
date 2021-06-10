@@ -11,7 +11,7 @@
   "scripts": {
     "build": "astro-scripts build \"src/*.ts\"",
     "prepare": "yarn build",
-    "test": "uvu -i test/fixtures"
+    "test": "rm -rf test/fixtures && mkdir test/fixtures && uvu -i test/fixtures"
   },
   "files": [
     "dist",

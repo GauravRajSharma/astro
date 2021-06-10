@@ -4,22 +4,27 @@ import { fileURLToPath } from 'url';
 import http from 'http';
 import { suite } from 'uvu';
 import execa from 'execa';
-import del from 'del';
 import glob from 'tiny-glob';
 import * as assert from 'uvu/assert';
 import { TEMPLATES } from '../dist/templates.js';
 
 // config
 const GITHUB_SHA = process.env.GITHUB_SHA || execa.sync('git', ['rev-parse', 'HEAD']).stdout; // process.env.GITHUB_SHA will be set in CI; if testing locally execa() will gather this
-const MAX_TEST_TIME = 60000; // maximum time a test may take (60s)
-const TIMER = {}; // keep track of every test’s run time (uvu requires manual setup for this)
+const TEMPLATE_SETUP = {}; // keep track of every template’s setup state
 const FIXTURES_DIR = path.join(fileURLToPath(path.dirname(import.meta.url)), 'fixtures');
 
-// helper
-async function fetch(url) {
-  return new Promise((resolve) => {
+// helpers
+async function fetch(url, attempt = 0) {
+  return new Promise((resolve, reject) => {
     http
       .get(url, (res) => {
+        // not OK
+        if (res.statusCode !== 200) {
+          reject(res.statusCode);
+          return;
+        }
+
+        // OK
         let body = '';
         res.on('data', (chunk) => {
           body += chunk;
@@ -27,47 +32,30 @@ async function fetch(url) {
         res.on('end', () => resolve({ statusCode: res.statusCode, body }));
       })
       .on('error', (err) => {
+        // other error
         reject(err);
       });
   });
 }
 
+async function setup(template) {
+  await TEMPLATE_SETUP[template];
+}
+
 // test
 const CreateAstro = suite('npm init astro');
 
-CreateAstro.before(async () => {
-  // clean install dir
-  await del(FIXTURES_DIR);
-  await fs.promises.mkdir(FIXTURES_DIR);
-
-  // install all templates & deps before running tests
-  await Promise.all(
-    TEMPLATES.map(async ({ value: template }) => {
-      const templateDir = path.join(FIXTURES_DIR, template);
-      await execa('../../create-astro.mjs', [templateDir, '--template', template, '--commit', GITHUB_SHA, '--force-overwrite'], {
-        cwd: FIXTURES_DIR,
-      });
-      await execa('yarn', ['--frozen-lockfile', '--silent'], { cwd: templateDir });
-    })
-  );
-});
-
-// enforce MAX_TEST_TIME
-CreateAstro.before.each(({ __test__ }) => {
-  if (TIMER[__test__]) throw new Error(`Test "${__test__}" already declared`);
-  TIMER[__test__] = setTimeout(() => {
-    throw new Error(`"${__test__}" did not finish within allowed time`);
-  }, MAX_TEST_TIME);
-});
-CreateAstro.after.each(({ __test__ }) => {
-  clearTimeout(TIMER[__test__]);
-});
-
 for (let n = 0; n < TEMPLATES.length; n++) {
+  // setup (done here rather than .before() because uvu swallows errors there)
   const template = TEMPLATES[n].value;
   const templateDir = path.join(FIXTURES_DIR, template);
+  TEMPLATE_SETUP[template] = execa('../../create-astro.mjs', [template, '--template', template, '--commit', GITHUB_SHA, '--force-overwrite'], {
+    cwd: FIXTURES_DIR,
+  }).then(() => execa('npm', ['install', '--no-package-lock', '--silent'], { cwd: templateDir }));
 
   CreateAstro(`${template} (install)`, async () => {
+    await setup(template);
+
     const DOES_HAVE = ['.gitignore', 'package.json', 'public', 'src'];
     const DOES_NOT_HAVE = ['.git', 'meta.json'];
 
@@ -83,16 +71,30 @@ for (let n = 0; n < TEMPLATES.length; n++) {
   });
 
   CreateAstro(`${template} (dev)`, async () => {
-    // start dev server
+    await setup(template);
+
+    // start dev server, and wait until the "Server started in" message appears
     const port = 3000 + n; // start new port per test
-    const devServer = execa('yarn', ['start', '--port', port], { cwd: templateDir });
-    await new Promise((resolve) => {
-      setTimeout(() => resolve(), 15000);
-    }); // give dev server flat 15s to set up
-    // TODO: try to ping dev server ASAP rather than waiting flat 15s
+    const devServer = execa('npm', ['run', 'start', '--', '--port', port], { cwd: templateDir });
+    let sigkill = setTimeout(() => {
+      throw new Error(`Dev server failed to start`); // if 10s has gone by with no update, kill process
+    }, 10000);
+    await new Promise((resolve, reject) => {
+      devServer.stdout.on('data', (data) => {
+        clearTimeout(sigkill);
+        sigkill = setTimeout(() => {
+          reject(`Dev server failed to start`);
+        }, 10000);
+        if (data.toString('utf8').includes('Server started')) resolve();
+      });
+      devServer.stderr.on('data', (data) => {
+        reject(data.toString('utf8'));
+      });
+    });
+    clearTimeout(sigkill);
 
     // ping dev server
-    const { statusCode, body } = await fetch(`http://localhost:${port}`);
+    const { statusCode, body } = (await fetch(`http://localhost:${port}`)) || {};
 
     // expect 200 to be returned with some response
     assert.equal(statusCode, 200, 'didn’t respond with 200');
@@ -103,10 +105,12 @@ for (let n = 0; n < TEMPLATES.length; n++) {
   });
 
   CreateAstro(`${template} (build)`, async () => {
+    await setup(template);
+
     const MUST_HAVE_FILES = ['index.html', '_astro'];
 
     // build template
-    await execa('yarn', ['build'], { cwd: templateDir });
+    await execa('npm', ['run', 'build'], { cwd: templateDir });
 
     // scan build dir
     const builtFiles = await glob('**/*', { cwd: path.join(templateDir, 'dist') });
